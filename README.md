@@ -520,3 +520,4 @@ For more information, including how to run `text and pose conditional video gene
 </details>
 
 # PicsartText2Video
+# PicsartText2Video
