@@ -41,7 +41,7 @@ class TextToVideoPipeline(StableDiffusionPipeline):
         unet: UNet2DConditionModel,
         scheduler: KarrasDiffusionSchedulers,
         safety_checker: StableDiffusionSafetyChecker,
-        feature_extractor: CLIPFeatureExtractor,
+        feature_extractor: CLIPImageProcessor,
         requires_safety_checker: bool = True,
     ):
         super().__init__(vae, text_encoder, tokenizer, unet, scheduler,
@@ -220,12 +220,26 @@ class TextToVideoPipeline(StableDiffusionPipeline):
             latents[idx] = self.warp_latents_independently(
                 latent[None], motion_field)
         return motion_field, latents
-
+    # start w/ randomly sampled latent code
+    # perform ddim_backward to get x_t_prime_(1 to m)
+    # define direction from global scene and camera motion
+    # computer global translation vector from each frame (for loop)
+    # apply the translation for each frame to a warping operation w(k)
+    # do ddpm_forard on each of the latents (after they're put throught the warping)
+        # ie put the result of the warping function
+        # store it in the corresponding latent code vars initially declared
+        # this gives the latent codes
+    # latent codes passed throuhg cross-frame attention
+        # cfa uses key and values from the first frame to generate
+            # the appearance and structure of a frame
+            # is carried on the succecceing frames so that
+            # preserves appearnace and identify of the foreground object
+        # other frames
     @torch.no_grad()
     def __call__(
         self,
         prompt: Union[str, List[str]],
-        video_length: Optional[int],
+        video_length: Optional[int],  # here to adjust video length
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
@@ -252,6 +266,7 @@ class TextToVideoPipeline(StableDiffusionPipeline):
         t1: int = 47,
         **kwargs,
     ):
+        # what are x0, x1, and x_t0, x_t1 (i think these are thr latent codes but what do t0 and t1 represent?
         frame_ids = kwargs.pop("frame_ids", list(range(video_length)))
         assert t0 < t1
         assert num_videos_per_prompt == 1
@@ -302,7 +317,7 @@ class TextToVideoPipeline(StableDiffusionPipeline):
         num_channels_latents = self.unet.in_channels
 
         xT = self.prepare_latents(
-            batch_size * num_videos_per_prompt,
+            batch_size * num_videos_per_prompt, # ??
             num_channels_latents,
             1,
             height,
@@ -316,9 +331,9 @@ class TextToVideoPipeline(StableDiffusionPipeline):
 
         # when motion field is not used, augment with random latent codes
         if use_motion_field:
-            xT = xT[:, :, :1]
+            xT = xT[:, :, :1] # what does this do? does this extract some of the latent codes?
         else:
-            if xT.shape[2] < video_length:
+            if xT.shape[2] < video_length: # if the shape of the last col in xT is < vid_len??
                 xT_missing = self.prepare_latents(
                     batch_size * num_videos_per_prompt,
                     num_channels_latents,
@@ -355,29 +370,34 @@ class TextToVideoPipeline(StableDiffusionPipeline):
         shape = (batch_size, num_channels_latents, 1, height //
                  self.vae_scale_factor, width // self.vae_scale_factor)
 
+        #latents are xT
         ddim_res = self.DDIM_backward(num_inference_steps=num_inference_steps, timesteps=timesteps, skip_t=1000, t0=t0, t1=t1, do_classifier_free_guidance=do_classifier_free_guidance,
                                       null_embs=null_embs, text_embeddings=text_embeddings, latents_local=xT, latents_dtype=dtype, guidance_scale=guidance_scale, guidance_stop_step=guidance_stop_step,
                                       callback=callback, callback_steps=callback_steps, extra_step_kwargs=extra_step_kwargs, num_warmup_steps=num_warmup_steps)
-
-        x0 = ddim_res["x0"].detach()
+        #what do lines 379-389 do??
+        # smoothening the video transition: from here
+        x0 = ddim_res["x0"].detach() # remvoes the requries_gradient param so the output is just the tensor and stores in x0?
+        # so is x0 all the frames?
 
         if "x_t0_1" in ddim_res:
-            x_t0_1 = ddim_res["x_t0_1"].detach()
+            x_t0_1 = ddim_res["x_t0_1"].detach() # extrracts the latent codes of x_t0_ first frame?
         if "x_t1_1" in ddim_res:
-            x_t1_1 = ddim_res["x_t1_1"].detach()
+            x_t1_1 = ddim_res["x_t1_1"].detach() # extrracts the latent codes of x_t1_ first frame?
         del ddim_res
         del xT
         if use_motion_field:
             del x0
 
-            x_t0_k = x_t0_1[:, :, :1, :, :].repeat(1, 1, video_length-1, 1, 1)
+            x_t0_k = x_t0_1[:, :, :1, :, :].repeat(1, 1, video_length-1, 1, 1) # latent code of first frame of x_t0 repeated??
 
             reference_flow, x_t0_k = self.create_motion_field_and_warp_latents(
                 motion_field_strength_x=motion_field_strength_x, motion_field_strength_y=motion_field_strength_y, latents=x_t0_k, video_length=video_length, frame_ids=frame_ids[1:])
 
             # assuming t0=t1=1000, if t0 = 1000
-            if t1 > t0:
-                x_t1_k = self.DDPM_forward(
+            # why only noising the frame if t1>t0? is it because here you're tryng to create a motion field
+            # so you'd only want to add motion if t1 is ahead of t0?
+            if t1 > t0: #t1 and t0 are timestamps
+                x_t1_k = self.DDPM_forward( #creating motion so add noise
                     x0=x_t0_k, t0=t0, tMax=t1, device=device, shape=shape, text_embeddings=text_embeddings, generator=generator)
             else:
                 x_t1_k = x_t0_k
@@ -385,18 +405,20 @@ class TextToVideoPipeline(StableDiffusionPipeline):
             if x_t1_1 is None:
                 raise Exception
 
-            x_t1 = torch.cat([x_t1_1, x_t1_k], dim=2).clone().detach()
-
+            #latents local = x_t1
+            x_t1 = torch.cat([x_t1_1, x_t1_k], dim=2).clone().detach()  #
+            # then de noise
             ddim_res = self.DDIM_backward(num_inference_steps=num_inference_steps, timesteps=timesteps, skip_t=t1, t0=-1, t1=-1, do_classifier_free_guidance=do_classifier_free_guidance,
                                           null_embs=null_embs, text_embeddings=text_embeddings, latents_local=x_t1, latents_dtype=dtype, guidance_scale=guidance_scale,
                                           guidance_stop_step=guidance_stop_step, callback=callback, callback_steps=callback_steps, extra_step_kwargs=extra_step_kwargs, num_warmup_steps=num_warmup_steps)
 
-            x0 = ddim_res["x0"].detach()
+            x0 = ddim_res["x0"].detach() # what does x0 contain?
             del ddim_res
             del x_t1
             del x_t1_1
             del x_t1_k
         else:
+            #what do x_t1 is a copy of x_t1_1 which is the first frame of the latent code??
             x_t1 = x_t1_1.clone()
             x_t1_1 = x_t1_1[:, :, :1, :, :].clone()
             x_t1_k = x_t1_1[:, :, 1:, :, :].clone()
@@ -430,7 +452,8 @@ class TextToVideoPipeline(StableDiffusionPipeline):
             x_t1_1_fg_masked_moved = []
             for batch_idx, x_t1_1_fg_masked_b in enumerate(x_t1_1_fg_masked):
                 x_t1_fg_masked_b = x_t1_1_fg_masked_b.clone()
-
+                #seems like the same short clip is being replayed over again in this line
+                #video length times
                 x_t1_fg_masked_b = x_t1_fg_masked_b.repeat(
                     1, video_length-1, 1, 1)
                 if use_motion_field:
@@ -447,10 +470,15 @@ class TextToVideoPipeline(StableDiffusionPipeline):
             x_t1_1_fg_masked_moved = torch.cat(x_t1_1_fg_masked_moved, dim=0)
 
             M_FG_1 = M_FG[:, :1, :, :]
-
+            # torch.cat concatenates the inputs along the row (0) or col(1)
+            # ex: x = [2,2],[4,4] y = [3,3],[5,5]
+            # torch.cat((X,y),dim = 0) = [[2,2],[4,4],[3,3],[5,5]]?
+            # torch.cat((X,y),dim = 1) = [[2,2,4,4,3,3,5,5]]?
             M_FG_warped = []
             for batch_idx, m_fg_1_b in enumerate(M_FG_1):
                 m_fg_1_b = m_fg_1_b[None, None]
+                # seems like the same short clip is being replayed over again in this line
+                # video length times
                 m_fg_b = m_fg_1_b.repeat(1, 1, video_length-1, 1, 1)
                 if use_motion_field:
                     m_fg_b = self.warp_latents_independently(
@@ -500,5 +528,5 @@ class TextToVideoPipeline(StableDiffusionPipeline):
 
         if not return_dict:
             return (image, has_nsfw_concept)
-
+                # from imported diffusers
         return TextToVideoPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
